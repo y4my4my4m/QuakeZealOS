@@ -1,0 +1,146 @@
+/*	Shrine mentions possibly using two FIFOs
+	(in our case, Queues) for pending and
+	empty frames. If logical to implement,
+	perhaps Zeal NetQueue code should
+	do something similar to that idea.
+
+	Each Ethernet Frame will be represented
+	as an entry in a CQueue. */
+
+class CNetQueueEntry:CQueue
+{
+	I64 packet_length;
+	U8	frame[ETHERNET_FRAME_SIZE];
+};
+
+
+/*	global variable, holds pointer of Ethernet Queue.
+	This acts as the Head of the Queue, Entries act
+	as the Tail of the Queue. 
+	Upon QueueInit, ->next and ->last are set to
+	itself, the Head. */
+
+CQueue *net_queue; // no QueueRemove the Head! only Entries!
+
+/*	Depth cap: a flood must not CAlloc the heap to death from the NIC IRQ.
+
+	net_queue is mutated from TWO interrupt contexts - the NIC IRQ pushes and
+	NetHandler pulls - so the list and the counter need a lock. Without one the
+	counter loses updates and drifts; once it drifts up to NETQUEUE_MAX it never
+	comes back down and every frame is dropped from then on. */
+#define NETQUEUE_MAX	64
+I64 net_queue_depth = 0;
+I64 net_queue_drops = 0;
+I64 net_queue_lock  = 0;
+
+U0 NetQueueInit()
+{
+	net_queue = CAlloc(sizeof(CQueue));
+	QueueInit(net_queue);
+	net_queue_depth = 0;
+	net_queue_drops = 0;
+	net_queue_lock  = 0;
+}
+
+CNetQueueEntry *NetQueuePull()
+{/*	Returns a pointer to a CNetQueueEntry,
+	or NULL pointer if Net Queue is empty. */
+
+	CNetQueueEntry *entry;
+
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
+
+	if (net_queue->next != net_queue)
+	{
+		entry = net_queue->next;
+		QueueRemove(entry);
+		if (net_queue_depth > 0)
+			net_queue_depth--;
+	}
+	else // Queue is empty if head->next is head itself.
+	{
+		entry = NULL;
+	}
+
+	LBtr(&net_queue_lock, 0);
+	POPFD
+
+	return entry;
+}
+
+U0 NetQueuePush(U8 *data, I64 length)
+{/*	Pushes a copy of the packet data and length
+	into the Net Queue. The NetQueueEntry is inserted
+	after the last entry of net_queue to keep new
+	items in the back of the Queue, old in front. */ 
+
+	CNetQueueEntry *entry;
+
+	/*	frame[] is fixed size and the caller is a NIC IRQ passing a length taken
+		from the receive ring, so an impossible length must not reach MemCopy. */
+	if (length < 1 || length > ETHERNET_FRAME_SIZE)
+		return;
+
+	entry = CAlloc(sizeof(CNetQueueEntry));
+	if (!entry)
+		return;
+
+	entry->packet_length = length;
+	MemCopy(entry->frame, data, length);
+
+	PUSHFD
+	CLI
+	while (LBts(&net_queue_lock, 0))
+		PAUSE
+
+	if (net_queue_depth >= NETQUEUE_MAX)
+	{
+		net_queue_drops++;
+		LBtr(&net_queue_lock, 0);
+		POPFD
+
+		Free(entry);
+		return;
+	}
+
+	QueueInsert(entry, net_queue->last);
+	net_queue_depth++;
+
+	LBtr(&net_queue_lock, 0);
+	POPFD
+
+	MPInt(I_NETHANDLER, INT_DEST_CPU);
+}
+
+U0 NetQueueLazyPull()
+{
+	PUSHFD
+	CLI
+
+	if (net_queue->next != net_queue)
+	{
+		NetLog("NETQUEUE LAZY PULL: Generating NetHandler interrupt.");
+		MPInt(I_NETHANDLER, INT_DEST_CPU);
+	}
+
+	POPFD
+}
+
+U0 NetQueueLazyPush(U8 *data, I64 length)
+{ // Push into NetQueue, don't trigger interrupt in this func.
+  // Trigger interrupt by Spawn-ing another Task to check queue.
+
+	CNetQueueEntry *entry = CAlloc(sizeof(CNetQueueEntry));
+
+	entry->packet_length = length;
+	MemCopy(entry->frame, data, length);
+	QueueInsert(entry, net_queue->last);
+
+	Spawn(&NetQueueLazyPull,, "NetQueueLazyPull");
+}
+
+NetQueueInit;
+
